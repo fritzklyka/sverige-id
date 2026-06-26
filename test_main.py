@@ -8,13 +8,16 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from httpx import ASGITransport, AsyncClient
 
-from main import app, auth_sessions_db, identities_db
+from main import app
+from database import engine, Base
 
 
 @pytest.fixture(autouse=True)
-def clear_db():
-    identities_db.clear()
-    auth_sessions_db.clear()
+async def clear_db():
+    # Re-create database schemas for isolation between tests
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
 
 
 @pytest.mark.asyncio
@@ -348,3 +351,21 @@ async def test_signature_verify_edge_cases():
         )
         assert res_ver.status_code == 200
         assert res_ver.json()["valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_jwks_endpoint():
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        res = await ac.get("/.well-known/jwks.json")
+        assert res.status_code == 200
+        data = res.json()
+        assert "keys" in data
+        assert len(data["keys"]) == 1
+        key = data["keys"][0]
+        assert key["kty"] == "RSA"
+        assert key["alg"] == "RS256"
+        assert key["use"] == "sig"
+        assert "n" in key
+        assert "e" in key

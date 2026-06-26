@@ -1,7 +1,9 @@
 import base64
 import io
 import logging
+import os
 import time
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID, uuid4
@@ -10,13 +12,18 @@ import jwt
 import qrcode
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
+from sqlalchemy import select, delete
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from database import Base, engine, get_db
+from models import AuthSessionTable, IdentityTable, SignatureTable
+from crypto_vault import compute_blind_index, encrypt_data, decrypt_data
 from schemas import (
     AuthInitiateRequest,
     AuthInitiateResponse,
@@ -43,34 +50,69 @@ log_format = (
 logging.basicConfig(level=logging.INFO, format=log_format)
 logger = logging.getLogger("eid_backend")
 
+# Database initialization via Lifespan event
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Automatically create tables (ideal for sovereign local/testing envs)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    # Clean up engine resources
+    await engine.dispose()
+
+
 app = FastAPI(
     title="Sverige-ID Platform Electronic Identification (eID) API",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
-import os
+# Cryptographic Token signing config (RS256)
+JWT_ALGORITHM = "RS256"
+ACTIVE_KEY_ID = "sverige-id-active-key"
 
-# Security
-JWT_SECRET = os.getenv("JWT_SECRET", "eid-mock-super-secret-key-12345")
-if JWT_SECRET == "eid-mock-super-secret-key-12345":
-    logger.warning("Using insecure fallback JWT_SECRET. Do NOT use this in production!")
+# Helper functions to convert RSA keys to JWK format
+def int_to_base64url(val: int) -> str:
+    byte_len = (val.bit_length() + 7) // 8
+    val_bytes = val.to_bytes(byte_len, byteorder="big")
+    return base64.urlsafe_b64encode(val_bytes).rstrip(b"=").decode("utf-8")
 
-JWT_ALGORITHM = "HS256"
+
+def get_jwk(pubkey: Any, kid: str) -> dict:
+    numbers = pubkey.public_numbers()
+    return {
+        "kty": "RSA",
+        "alg": "RS256",
+        "use": "sig",
+        "kid": kid,
+        "n": int_to_base64url(numbers.n),
+        "e": int_to_base64url(numbers.e),
+    }
+
+
+# Load RSA Private Key or generate a transient one for dev
+private_key_pem = os.getenv("JWT_PRIVATE_KEY")
+if private_key_pem:
+    try:
+        private_key = load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
+        logger.info("Successfully loaded JWT private key from environment.")
+    except Exception as err:
+        logger.error(f"Failed to load JWT_PRIVATE_KEY: {err}. Generating transient fallback key.")
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+else:
+    logger.warning("No JWT_PRIVATE_KEY found in environment. Generating a transient RSA key pair for development.")
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+public_key = private_key.public_key()
+ACTIVE_JWK = get_jwk(public_key, ACTIVE_KEY_ID)
+
 security_bearer = HTTPBearer()
-
-# In-memory stores
-# national_id -> identity_details
-identities_db: dict[str, dict[str, Any]] = {}
-# session_id -> session_details
-auth_sessions_db: dict[UUID, dict[str, Any]] = {}
-# signature_b64 -> signature_details
-signatures_db: dict[str, dict[str, Any]] = {}
 
 
 def get_current_user(token: Annotated[Any, Depends(security_bearer)]) -> str:
-    """Dependency to validate the JWT and return the user's national_id (subject)."""
+    """Dependency to validate the JWT using public key and return subject."""
     try:
-        payload = jwt.decode(token.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(token.credentials, public_key, algorithms=[JWT_ALGORITHM])
         national_id = payload.get("sub")
         if not national_id:
             logger.warning("Token missing subject claim")
@@ -107,6 +149,12 @@ async def http_exception_handler(request: Any, exc: HTTPException) -> JSONRespon
     )
 
 
+@app.get("/.well-known/jwks.json")
+async def get_jwks() -> dict:
+    """Public JWKS endpoint for relying parties to discover public verification keys."""
+    return {"keys": [ACTIVE_JWK]}
+
+
 @app.post(
     "/v1/identity/onboard",
     response_model=OnboardResponse,
@@ -116,28 +164,45 @@ async def http_exception_handler(request: Any, exc: HTTPException) -> JSONRespon
         500: {"model": ErrorResponse},
     },
 )
-async def onboard(payload: OnboardRequest) -> OnboardResponse:
-    logger.info(f"Onboarding request received for: {payload.national_id}")
+async def onboard(
+    payload: OnboardRequest,
+    db: AsyncSession = Depends(get_db),
+) -> OnboardResponse:
+    logger.info(f"Onboarding request received.")
 
-    if payload.national_id in identities_db:
-        logger.warning(f"Identity already exists: {payload.national_id}")
+    # Calculate blind index to search for duplicate
+    blind_index = compute_blind_index(payload.national_id)
+    
+    result = await db.execute(
+        select(IdentityTable).where(IdentityTable.national_id_blind_index == blind_index)
+    )
+    existing_identity = result.scalars().first()
+    if existing_identity:
+        logger.warning(f"Identity already exists matching blind index.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Identity with this national ID already exists.",
         )
 
-    identity_id = uuid4()
-    identities_db[payload.national_id] = {
-        "identity_id": identity_id,
-        "full_name": payload.full_name,
-        "date_of_birth": payload.date_of_birth,
-        "status": IdentityStatus.VERIFIED,
-        "card_public_key": payload.card_public_key,
-    }
+    identity_id = str(uuid4())
+    
+    # Encrypt PII attributes before database insertion
+    new_identity = IdentityTable(
+        id=identity_id,
+        national_id_blind_index=blind_index,
+        encrypted_national_id=encrypt_data(payload.national_id),
+        encrypted_full_name=encrypt_data(payload.full_name),
+        encrypted_date_of_birth=encrypt_data(payload.date_of_birth),
+        card_public_key=payload.card_public_key,
+        status=IdentityStatus.VERIFIED,
+    )
+    
+    db.add(new_identity)
+    await db.commit()
 
     logger.info(f"Identity onboarded successfully. ID: {identity_id}")
     return OnboardResponse(
-        identity_id=identity_id,
+        identity_id=UUID(identity_id),
         status=IdentityStatus.PENDING,
         message="Identity submitted successfully and is pending verification.",
     )
@@ -153,55 +218,50 @@ async def onboard(payload: OnboardRequest) -> OnboardResponse:
         500: {"model": ErrorResponse},
     },
 )
-async def initiate_auth(payload: AuthInitiateRequest) -> AuthInitiateResponse:
-    logger.info(
-        f"Initiating authentication for national ID: {payload.national_id} "
-        f"via {payload.auth_method}"
-    )
+async def initiate_auth(
+    payload: AuthInitiateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> AuthInitiateResponse:
+    logger.info(f"Initiating authentication via {payload.auth_method}")
 
-    identity = identities_db.get(payload.national_id)
+    # Resolve using blind index
+    blind_index = compute_blind_index(payload.national_id)
+    result = await db.execute(
+        select(IdentityTable).where(IdentityTable.national_id_blind_index == blind_index)
+    )
+    identity = result.scalars().first()
     if not identity:
-        logger.warning(f"Identity not found: {payload.national_id}")
+        logger.warning("Identity not found.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Identity not found.",
         )
 
-    if identity["status"] != IdentityStatus.VERIFIED:
-        logger.warning(f"Identity status is not active: {identity['status']}")
+    if identity.status != IdentityStatus.VERIFIED:
+        logger.warning(f"Identity status is not active: {identity.status}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Identity is not verified or active.",
         )
 
-    session_id = uuid4()
+    session_id = str(uuid4())
     challenge_nonce = None
     qr_code_payload = None
     qr_code_image = None
+    challenge_code = None
+    approved = False
 
     if payload.auth_method == ChallengeType.SMART_CARD:
-        if not identity.get("card_public_key"):
+        if not identity.card_public_key:
             logger.warning("Smart card auth requested but no public key registered")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No card public key registered for this identity.",
             )
         challenge_nonce = uuid4().hex
-        auth_sessions_db[session_id] = {
-            "national_id": payload.national_id,
-            "challenge_type": ChallengeType.SMART_CARD,
-            "challenge_nonce": challenge_nonce,
-            "expires_at": time.time() + 300,
-        }
         msg = "Please sign the challenge nonce using your ISO/IEC 7810 card reader."
     elif payload.auth_method == ChallengeType.QR_CODE:
         qr_code_payload = f"eid-auth://scan?session={session_id}"
-        auth_sessions_db[session_id] = {
-            "national_id": payload.national_id,
-            "challenge_type": ChallengeType.QR_CODE,
-            "approved": False,
-            "expires_at": time.time() + 300,
-        }
         msg = "Scan the QR code with your mobile app to authenticate."
         try:
             qr = qrcode.QRCode(version=1, box_size=10, border=4)
@@ -209,7 +269,10 @@ async def initiate_auth(payload: AuthInitiateRequest) -> AuthInitiateResponse:
             qr.make(fit=True)
             img = qr.make_image(fill_color="black", back_color="white")
             buf = io.BytesIO()
-            img.save(buf, format="PNG")
+            try:
+                img.save(buf, format="PNG")
+            except TypeError:
+                img.save(buf)
             qr_bytes = buf.getvalue()
             qr_code_image = (
                 f"data:image/png;base64,"
@@ -220,20 +283,28 @@ async def initiate_auth(payload: AuthInitiateRequest) -> AuthInitiateResponse:
             qr_code_image = None
     else:
         # PUSH_NOTIFICATION or TOTP
-        auth_sessions_db[session_id] = {
-            "national_id": payload.national_id,
-            "challenge_type": payload.auth_method,
-            "challenge_code": "APPROVED",
-            "expires_at": time.time() + 300,
-        }
+        challenge_code = "APPROVED"
         msg = (
             "A push notification has been sent to your registered device. "
             "Please approve it."
         )
 
+    # Save session to DB
+    new_session = AuthSessionTable(
+        id=session_id,
+        national_id_blind_index=blind_index,
+        challenge_type=payload.auth_method,
+        challenge_nonce=challenge_nonce,
+        challenge_code=challenge_code,
+        approved=approved,
+        expires_at=time.time() + 300,
+    )
+    db.add(new_session)
+    await db.commit()
+
     logger.info(f"Auth session created: {session_id}")
     return AuthInitiateResponse(
-        session_id=session_id,
+        session_id=UUID(session_id),
         challenge_type=payload.auth_method,
         challenge_message=msg,
         challenge_nonce=challenge_nonce,
@@ -249,20 +320,29 @@ async def initiate_auth(payload: AuthInitiateRequest) -> AuthInitiateResponse:
         400: {"model": ErrorResponse},
     },
 )
-async def qr_approve(payload: QRApproveRequest) -> dict[str, str]:
+async def qr_approve(
+    payload: QRApproveRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
     logger.info(f"QR approval scan received for session: {payload.session_id}")
-    session = auth_sessions_db.get(payload.session_id)
+    
+    result = await db.execute(
+        select(AuthSessionTable).where(AuthSessionTable.id == str(payload.session_id))
+    )
+    session = result.scalars().first()
     if not session:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Session not found.",
         )
-    if session["challenge_type"] != ChallengeType.QR_CODE:
+    if session.challenge_type != ChallengeType.QR_CODE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Session is not a QR Code challenge session.",
         )
-    session["approved"] = payload.approved
+    session.approved = payload.approved
+    await db.commit()
+    
     status_str = "approved" if payload.approved else "rejected"
     logger.info(f"QR session {payload.session_id} has been {status_str}")
     return {"status": status_str}
@@ -278,10 +358,16 @@ async def qr_approve(payload: QRApproveRequest) -> dict[str, str]:
         500: {"model": ErrorResponse},
     },
 )
-async def verify_auth(payload: AuthVerifyRequest) -> AuthVerifyResponse:
+async def verify_auth(
+    payload: AuthVerifyRequest,
+    db: AsyncSession = Depends(get_db),
+) -> AuthVerifyResponse:
     logger.info(f"Verifying session: {payload.session_id}")
 
-    session = auth_sessions_db.get(payload.session_id)
+    result = await db.execute(
+        select(AuthSessionTable).where(AuthSessionTable.id == str(payload.session_id))
+    )
+    session = result.scalars().first()
     if not session:
         logger.warning(f"Auth session not found: {payload.session_id}")
         raise HTTPException(
@@ -289,15 +375,27 @@ async def verify_auth(payload: AuthVerifyRequest) -> AuthVerifyResponse:
             detail="Session not found.",
         )
 
-    if time.time() > session["expires_at"]:
-        auth_sessions_db.pop(payload.session_id, None)
+    if time.time() > session.expires_at:
+        await db.delete(session)
+        await db.commit()
         logger.warning(f"Session expired: {payload.session_id}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Session has expired.",
         )
 
-    challenge_type = session["challenge_type"]
+    challenge_type = session.challenge_type
+
+    # Find the corresponding identity
+    result_identity = await db.execute(
+        select(IdentityTable).where(IdentityTable.national_id_blind_index == session.national_id_blind_index)
+    )
+    identity = result_identity.scalars().first()
+    if not identity:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Identity public key not found.",
+        )
 
     if challenge_type == ChallengeType.SMART_CARD:
         if not payload.signature:
@@ -305,17 +403,16 @@ async def verify_auth(payload: AuthVerifyRequest) -> AuthVerifyResponse:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Signature is required for SMART_CARD verification.",
             )
-        identity = identities_db.get(session["national_id"])
-        if not identity or not identity.get("card_public_key"):
+        if not identity.card_public_key:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Identity public key not found.",
             )
         try:
-            pubkey = load_pem_public_key(identity["card_public_key"].encode("utf-8"))
+            pubkey = load_pem_public_key(identity.card_public_key.encode("utf-8"))
             pubkey.verify(
                 base64.b64decode(payload.signature),
-                session["challenge_nonce"].encode("utf-8"),
+                session.challenge_nonce.encode("utf-8"),
                 padding.PKCS1v15(),
                 hashes.SHA256(),
             )
@@ -333,7 +430,7 @@ async def verify_auth(payload: AuthVerifyRequest) -> AuthVerifyResponse:
             ) from err
 
     elif challenge_type == ChallengeType.QR_CODE:
-        if not session.get("approved"):
+        if not session.approved:
             logger.warning("QR auth verify requested but session not approved yet")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -342,7 +439,7 @@ async def verify_auth(payload: AuthVerifyRequest) -> AuthVerifyResponse:
 
     else:
         # PUSH_NOTIFICATION or TOTP
-        if payload.code != session["challenge_code"]:
+        if payload.code != session.challenge_code:
             logger.warning(
                 f"Invalid MFA code provided for session: {payload.session_id}"
             )
@@ -351,8 +448,10 @@ async def verify_auth(payload: AuthVerifyRequest) -> AuthVerifyResponse:
                 detail="MFA verification failed.",
             )
 
-    # Generate JWT
-    national_id = session["national_id"]
+    # Decrypt national_id to include in token payload
+    national_id = decrypt_data(identity.encrypted_national_id)
+    
+    # Generate JWT signed via RS256 Asymmetric Key
     now = int(time.time())
     jwt_payload = {
         "iss": "eid-mock-backend",
@@ -360,12 +459,14 @@ async def verify_auth(payload: AuthVerifyRequest) -> AuthVerifyResponse:
         "iat": now,
         "exp": now + 3600,
     }
-    token = jwt.encode(jwt_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    jwt_headers = {"kid": ACTIVE_KEY_ID}
+    token = jwt.encode(jwt_payload, private_key, algorithm=JWT_ALGORITHM, headers=jwt_headers)
 
     # Clean up session
-    auth_sessions_db.pop(payload.session_id, None)
+    await db.delete(session)
+    await db.commit()
 
-    logger.info(f"MFA verification successful for {national_id}. Issued token.")
+    logger.info(f"MFA verification successful. Issued token.")
     return AuthVerifyResponse(
         access_token=token,
         token_type="Bearer",
@@ -386,8 +487,9 @@ async def verify_auth(payload: AuthVerifyRequest) -> AuthVerifyResponse:
 async def sign_document(
     payload: SignRequest,
     national_id: Annotated[str, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
 ) -> SignResponse:
-    logger.info(f"Document signing requested by: {national_id}")
+    logger.info(f"Document signing requested.")
 
     # Validate that document_hash is valid base64
     try:
@@ -399,8 +501,7 @@ async def sign_document(
             detail="Invalid base64-encoded document hash.",
         ) from err
 
-    # Create a mock PKCS#7 / detached signature:
-    # A base64-encoded JSON representation of the signature
+    # Create a mock PKCS#7 / detached signature
     signed_at = datetime.now(UTC)
     sig_payload = (
         f"MOCK-PKCS7-SIG-FOR-HASH:{payload.document_hash}:"
@@ -409,12 +510,18 @@ async def sign_document(
     signature_bytes = base64.b64encode(sig_payload.encode("utf-8"))
     signature_str = signature_bytes.decode("utf-8")
 
-    # Store signature details in db for status checking/verification
-    signatures_db[signature_str] = {
-        "original_hash": payload.document_hash,
-        "signer": national_id,
-        "signed_at": signed_at,
-    }
+    # Compute blind index of user
+    blind_index = compute_blind_index(national_id)
+
+    # Store signature details in db
+    new_signature = SignatureTable(
+        signature_hash=signature_str,
+        original_hash=payload.document_hash,
+        signer_blind_index=blind_index,
+        signed_at=signed_at.replace(tzinfo=None), # SQLite compatibility
+    )
+    db.add(new_signature)
+    await db.commit()
 
     logger.info("Document signed successfully")
     return SignResponse(
@@ -433,7 +540,10 @@ async def sign_document(
         500: {"model": ErrorResponse},
     },
 )
-async def verify_signature(payload: VerifyRequest) -> VerifyResponse:
+async def verify_signature(
+    payload: VerifyRequest,
+    db: AsyncSession = Depends(get_db),
+) -> VerifyResponse:
     logger.info(f"Verification request of type: {payload.verification_type}")
 
     if payload.verification_type == VerificationType.TOKEN:
@@ -443,7 +553,7 @@ async def verify_signature(payload: VerifyRequest) -> VerifyResponse:
                 detail="Token must be provided for TOKEN verification.",
             )
         try:
-            jwt.decode(payload.token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            jwt.decode(payload.token, public_key, algorithms=[JWT_ALGORITHM])
             return VerifyResponse(valid=True, status_message="Token is valid.")
         except ExpiredSignatureError:
             return VerifyResponse(valid=False, status_message="Token has expired.")
@@ -461,14 +571,17 @@ async def verify_signature(payload: VerifyRequest) -> VerifyResponse:
                 detail=msg,
             )
 
-        sig_data = signatures_db.get(payload.signature)
+        result = await db.execute(
+            select(SignatureTable).where(SignatureTable.signature_hash == payload.signature)
+        )
+        sig_data = result.scalars().first()
         if not sig_data:
             logger.warning("Signature not found in verification DB")
             return VerifyResponse(
                 valid=False, status_message="Signature not found or unrecognized."
             )
 
-        if sig_data["original_hash"] != payload.original_hash:
+        if sig_data.original_hash != payload.original_hash:
             logger.warning("Signature original hash mismatch")
             msg = "Signature hash does not match the provided original hash."
             return VerifyResponse(

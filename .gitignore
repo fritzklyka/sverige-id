@@ -3,3 +3,6 @@
 __pycache__/
 .pytest_cache/
 sovereignty_roadmap.md
+eid_platform.db
+*.sqlite3
+*.log
