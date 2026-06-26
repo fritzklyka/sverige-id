@@ -1,0 +1,361 @@
+openapi: 3.0.3
+info:
+  title: Platform Electronic Identification (eID) Mock API
+  version: 1.0.0
+  description: |
+    A mockup API for a platform Electronic Identification (eID) system.
+    This mock system manages identity registration/onboarding, session authentication,
+    document signature generating, and verification.
+paths:
+  /v1/identity/onboard:
+    post:
+      summary: Onboard / Register a new identity
+      operationId: onboardIdentity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OnboardRequest'
+      responses:
+        '201':
+          description: Identity onboarded successfully, pending verification.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnboardResponse'
+        '400':
+          description: Invalid input or validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/initiate:
+    post:
+      summary: Initiate an eID login session
+      operationId: initiateAuth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthInitiateRequest'
+      responses:
+        '200':
+          description: Authentication session initiated, MFA challenge pending.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthInitiateResponse'
+        '400':
+          description: Invalid national ID or identity not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Identity status is not active or verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/verify:
+    post:
+      summary: Verify the MFA challenge and get a JWT access token
+      operationId: verifyAuth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthVerifyRequest'
+      responses:
+        '200':
+          description: MFA challenge verified successfully. JWT access token returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthVerifyResponse'
+        '400':
+          description: Invalid session ID or validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: MFA verification failed (e.g. incorrect OTP or rejected push)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/signature/sign:
+    post:
+      summary: Sign a document hash using an active eID session JWT
+      operationId: signDocument
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignRequest'
+      responses:
+        '200':
+          description: Document hash signed successfully. Returns a mock PKCS#7 signature.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignResponse'
+        '400':
+          description: Invalid request parameter (e.g. invalid base64 hash)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized / Invalid or expired JWT token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/signature/verify:
+    post:
+      summary: Verify if an eID token or a PKCS#7 signature is valid
+      operationId: verifySignature
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyRequest'
+      responses:
+        '200':
+          description: Verification results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifyResponse'
+        '400':
+          description: Invalid request format or validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    OnboardRequest:
+      type: object
+      required:
+        - national_id
+        - full_name
+        - date_of_birth
+      properties:
+        national_id:
+          type: string
+          pattern: '^[0-9A-Za-z-]{6,20}$'
+          example: "19900101-1234"
+        full_name:
+          type: string
+          minLength: 2
+          example: "Sven Svensson"
+        date_of_birth:
+          type: string
+          format: date
+          example: "1990-01-01"
+
+    OnboardResponse:
+      type: object
+      required:
+        - identity_id
+        - status
+        - message
+      properties:
+        identity_id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        status:
+          type: string
+          enum: [PENDING, VERIFIED, REJECTED]
+          example: "PENDING"
+        message:
+          type: string
+          example: "Identity submitted successfully and is pending verification."
+
+    AuthInitiateRequest:
+      type: object
+      required:
+        - national_id
+      properties:
+        national_id:
+          type: string
+          example: "19900101-1234"
+
+    AuthInitiateResponse:
+      type: object
+      required:
+        - session_id
+        - challenge_type
+        - challenge_message
+      properties:
+        session_id:
+          type: string
+          format: uuid
+          example: "a8b9c102-d3e4-f5a6-b7c8-d9e0f1a2b3c4"
+        challenge_type:
+          type: string
+          enum: [PUSH_NOTIFICATION, TOTP]
+          example: "PUSH_NOTIFICATION"
+        challenge_message:
+          type: string
+          example: "A push notification has been sent to your registered device. Please approve it."
+
+    AuthVerifyRequest:
+      type: object
+      required:
+        - session_id
+        - code
+      properties:
+        session_id:
+          type: string
+          format: uuid
+          example: "a8b9c102-d3e4-f5a6-b7c8-d9e0f1a2b3c4"
+        code:
+          type: string
+          example: "APPROVED"
+
+    AuthVerifyResponse:
+      type: object
+      required:
+        - access_token
+        - token_type
+        - expires_in
+      properties:
+        access_token:
+          type: string
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxOTkwMDEwMS0xMjM0IiwiZXhwIjoxNTE2MjM5MDIyfQ..."
+        token_type:
+          type: string
+          example: "Bearer"
+        expires_in:
+          type: integer
+          example: 3600
+
+    SignRequest:
+      type: object
+      required:
+        - document_hash
+      properties:
+        document_hash:
+          type: string
+          description: Base64-encoded SHA-256 hash of the document.
+          example: "MWU3ZGM3YjFhOTM0NWU4Zjg0Yzg5MjgxYzBhYWY2Mzk4MzNkOTVkYmE4NmY2NTBlMmZkZmQ0ZjQ4NmRjM2IyZg=="
+
+    SignResponse:
+      type: object
+      required:
+        - signature
+        - algorithm
+        - signed_at
+      properties:
+        signature:
+          type: string
+          description: Base64-encoded mock PKCS#7 signature.
+          example: "MIIBiQYJKoZIhvcNAQcCoIIBejCCAXYCAQExADALBgkqhkiG9w0BBwGgggFGMII..."
+        algorithm:
+          type: string
+          example: "SHA256withRSA"
+        signed_at:
+          type: string
+          format: date-time
+          example: "2026-06-26T10:19:00Z"
+
+    VerifyRequest:
+      type: object
+      required:
+        - verification_type
+      properties:
+        verification_type:
+          type: string
+          enum: [TOKEN, SIGNATURE]
+          example: "SIGNATURE"
+        token:
+          type: string
+          description: The JWT access token (required if verification_type is TOKEN).
+          example: "eyJhbGciOiJIUzI1Ni..."
+        signature:
+          type: string
+          description: The Base64-encoded signature (required if verification_type is SIGNATURE).
+          example: "MIIBiQYJKoZIhvcNAQcCo..."
+        original_hash:
+          type: string
+          description: The original Base64-encoded document hash (required if verification_type is SIGNATURE).
+          example: "MWU3ZGM3YjFhOTM0NWU4Zjg0Yzg5MjgxYzBhYWY2Mzk4MzNkOTVkYmE4NmY2NTBlMmZkZmQ0ZjQ4NmRjM2IyZg=="
+
+    VerifyResponse:
+      type: object
+      required:
+        - valid
+        - status_message
+      properties:
+        valid:
+          type: boolean
+          example: true
+        status_message:
+          type: string
+          example: "Signature is valid and matches the provided original hash."
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+          example: "Bad Request"
+        message:
+          type: string
+          example: "The request could not be understood or was missing required parameters."
