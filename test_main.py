@@ -1,6 +1,10 @@
 import base64
+import datetime
 import time
 from unittest.mock import patch
+
+from cryptography import x509
+from cryptography.x509.oid import NameOID
 
 import pytest
 from cryptography.hazmat.primitives import hashes
@@ -369,3 +373,53 @@ async def test_jwks_endpoint():
         assert key["use"] == "sig"
         assert "n" in key
         assert "e" in key
+
+
+@pytest.mark.asyncio
+async def test_mtls_authentication_flow():
+    import urllib.parse
+    
+    national_id = "19900101-1234"
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as ac:
+        # Onboard user
+        onboard_payload = {
+            "national_id": national_id,
+            "full_name": "Sven Svensson",
+            "date_of_birth": "1990-01-01",
+        }
+        res_onboard = await ac.post("/v1/identity/onboard", json=onboard_payload)
+        assert res_onboard.status_code == 201
+
+        # Generate a client certificate for this user
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, f"Sven {national_id}"),
+            x509.NameAttribute(NameOID.SERIAL_NUMBER, national_id),
+        ])
+        cert = x509.CertificateBuilder().subject_name(
+            subject
+        ).issuer_name(
+            issuer
+        ).public_key(
+            private_key.public_key()
+        ).serial_number(
+            x509.random_serial_number()
+        ).not_valid_before(
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)
+        ).not_valid_after(
+            datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=1)
+        ).sign(private_key, hashes.SHA256())
+        
+        cert_pem = cert.public_bytes(Encoding.PEM).decode("utf-8")
+
+        # Request mTLS login
+        res_mtls = await ac.post(
+            "/v1/auth/mtls",
+            headers={"X-SSL-Client-Cert": urllib.parse.quote(cert_pem)},
+        )
+        assert res_mtls.status_code == 200
+        data = res_mtls.json()
+        assert "access_token" in data
+        assert data["token_type"] == "Bearer"

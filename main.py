@@ -2,7 +2,9 @@ import base64
 import io
 import logging
 import os
+import re
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any
@@ -10,11 +12,12 @@ from uuid import UUID, uuid4
 
 import jwt
 import qrcode
+from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Header, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
@@ -149,10 +152,127 @@ async def http_exception_handler(request: Any, exc: HTTPException) -> JSONRespon
     )
 
 
+# Helper to decode and load client certificate from forwarded headers
+def parse_client_cert(cert_header: str) -> x509.Certificate:
+    decoded = urllib.parse.unquote(cert_header)
+    
+    # Normalize space-separated PEM components forwarded by proxies (like Nginx)
+    if "-----BEGIN CERTIFICATE-----" not in decoded:
+        cleaned = decoded.replace(" ", "\n")
+        if "BEGIN\nCERTIFICATE" in cleaned:
+            cleaned = cleaned.replace("BEGIN\nCERTIFICATE", "BEGIN CERTIFICATE")
+        if "END\nCERTIFICATE" in cleaned:
+            cleaned = cleaned.replace("END\nCERTIFICATE", "END CERTIFICATE")
+        decoded = cleaned
+
+    try:
+        cert_bytes = decoded.encode("utf-8")
+        return x509.load_pem_x509_certificate(cert_bytes)
+    except Exception as err:
+        logger.error(f"Failed to parse client certificate: {err}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to parse forwarded client certificate.",
+        ) from err
+
+
+def extract_national_id_from_cert(cert: x509.Certificate) -> str:
+    # Attempt to retrieve Serial Number from Subject details (Swedish standard format)
+    serial_numbers = cert.subject.get_attributes_for_oid(x509.NameOID.SERIAL_NUMBER)
+    if serial_numbers:
+        return serial_numbers[0].value
+    
+    # Fallback to parsing CN field patterns (e.g. "Sven Svensson 19900101-1234")
+    common_names = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+    if common_names:
+        cn_val = common_names[0].value
+        match = re.search(r"\b(\d{8}-?\d{4}|\d{6}-?\d{4})\b", cn_val)
+        if match:
+            return match.group(1)
+        return cn_val
+        
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Could not extract National ID from client certificate Subject.",
+    )
+
+
 @app.get("/.well-known/jwks.json")
 async def get_jwks() -> dict:
     """Public JWKS endpoint for relying parties to discover public verification keys."""
     return {"keys": [ACTIVE_JWK]}
+
+
+@app.post(
+    "/v1/auth/mtls",
+    response_model=AuthVerifyResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def verify_mtls(
+    x_ssl_client_cert: Annotated[str | None, Header(alias="X-SSL-Client-Cert")] = None,
+    db: AsyncSession = Depends(get_db),
+) -> AuthVerifyResponse:
+    """Authenticates users via an mTLS client certificate forwarded by reverse proxies."""
+    logger.info("mTLS authentication endpoint triggered")
+
+    if not x_ssl_client_cert:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Client certificate header (X-SSL-Client-Cert) is missing.",
+        )
+
+    cert = parse_client_cert(x_ssl_client_cert)
+
+    # Verify certificate lifetime validity
+    now = datetime.now(UTC)
+    if now < cert.not_valid_before_utc or now > cert.not_valid_after_utc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Client certificate is expired or not yet active.",
+        )
+
+    national_id = extract_national_id_from_cert(cert)
+    
+    # Search database by blind index of national_id
+    blind_index = compute_blind_index(national_id)
+    result = await db.execute(
+        select(IdentityTable).where(IdentityTable.national_id_blind_index == blind_index)
+    )
+    identity = result.scalars().first()
+    if not identity:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Identity matching client certificate not onboarded.",
+        )
+
+    if identity.status != IdentityStatus.VERIFIED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Identity is not verified or active.",
+        )
+
+    # Generate JWT
+    now_ts = int(time.time())
+    jwt_payload = {
+        "iss": "eid-mock-backend",
+        "sub": national_id,
+        "iat": now_ts,
+        "exp": now_ts + 3600,
+    }
+    jwt_headers = {"kid": ACTIVE_KEY_ID}
+    token = jwt.encode(jwt_payload, private_key, algorithm=JWT_ALGORITHM, headers=jwt_headers)
+
+    logger.info(f"mTLS authentication successful for Subject: {national_id}. Issued token.")
+    return AuthVerifyResponse(
+        access_token=token,
+        token_type="Bearer",
+        expires_in=3600,
+    )
 
 
 @app.post(
