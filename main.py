@@ -48,8 +48,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
+import os
+
 # Security
-JWT_SECRET = "eid-mock-super-secret-key-12345"
+JWT_SECRET = os.getenv("JWT_SECRET", "eid-mock-super-secret-key-12345")
+if JWT_SECRET == "eid-mock-super-secret-key-12345":
+    logger.warning("Using insecure fallback JWT_SECRET. Do NOT use this in production!")
+
 JWT_ALGORITHM = "HS256"
 security_bearer = HTTPBearer()
 

@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sverige-id
+  labels:
+    app: sverige-id
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sverige-id
+  template:
+    metadata:
+      labels:
+        app: sverige-id
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: backend
+        image: sverige-id:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          limits:
+            cpu: "1"
+            memory: 512Mi
+          requests:
+            cpu: 250m
+            memory: 256Mi
+        env:
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: sverige-id-secrets
+              key: jwt-secret
+        # We can configure Python to write temporary files to a tmpfs/emptyDir if required.
+        # But PIL/qrcode generates images entirely in-memory using BytesIO, so no disk writes occur.
+        volumeMounts:
+        - name: tmp-volume
+          mountPath: /tmp
+      volumes:
+      - name: tmp-volume
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sverige-id
+spec:
+  selector:
+    app: sverige-id
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
+  type: ClusterIP
