@@ -140,7 +140,9 @@ def get_current_user(token: Annotated[Any, Depends(security_bearer)]) -> str:
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Any, exc: HTTPException) -> JSONResponse:
-    if exc.status_code >= 500:
+    if "not approved by user app" in str(exc.detail):
+        logger.debug(f"HTTPException occurred: {exc.detail}")
+    elif exc.status_code >= 500:
         logger.error(f"HTTPException occurred: {exc.detail}")
     else:
         logger.warning(f"HTTPException occurred: {exc.detail}")
@@ -583,7 +585,7 @@ async def verify_auth(
 
     elif challenge_type == ChallengeType.QR_CODE:
         if not session.approved:
-            logger.warning("QR auth verify requested but session not approved yet")
+            logger.debug("QR auth verify requested but session not approved yet")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="MFA verification failed: QR code not approved by user app.",
