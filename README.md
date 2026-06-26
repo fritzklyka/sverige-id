@@ -10,9 +10,10 @@ No complex enterprise middleware. No clunky SDKs. Just a pure, beautiful, and se
 
 ## The Stack
 *   **FastAPI & Pydantic v2**: Lightning-fast endpoints with type safety and automatic validation.
+*   **qrcode & Pillow**: On-the-fly generation of base64 PNG data URIs for instant QR scanning.
 *   **uv**: Package management that actually works, instantly.
 *   **Ruff**: Zero-tolerance strict linting because identity systems require perfection.
-*   **Pytest**: Robust asynchronous testing that keeps the codebase bulletproof.
+*   **Pytest & Cryptography**: Robust asynchronous testing and real asymmetric signature checks.
 
 ---
 
@@ -41,8 +42,9 @@ uv run pytest -v
 
 ## Core Workflows
 
-1.  **Identity Onboarding** (`POST /v1/identity/onboard`): Registers legal identities. Returns a `PENDING` response, then immediately updates internal state to `VERIFIED` so you can test logins seamlessly without waiting for bureaucracy.
-2.  **Authentication & MFA Challenge** (`POST /v1/auth/initiate`): Spins up secure identity sessions. Generates standard MFA push or TOTP challenges.
-3.  **MFA Verification** (`POST /v1/auth/verify`): Approves the challenge and returns a robust HS256 JWT access token.
-4.  **Digital Signing** (`POST /v1/signature/sign`): Generates a secure base64-encoded mock PKCS#7 / detached signature for any document hash using your active session.
-5.  **Status Check** (`POST /v1/signature/verify`): Verify token states and signature authenticity with zero latency.
+1.  **Identity Onboarding** (`POST /v1/identity/onboard`): Registers legal identities. Optionally accepts a PEM-encoded `card_public_key` for smart card integrations. Returns a `PENDING` response, then immediately updates internal state to `VERIFIED`.
+2.  **Authentication & MFA Challenge** (`POST /v1/auth/initiate`): Initiates secure identity sessions. Supports four modes: `PUSH_NOTIFICATION`, `TOTP`, `SMART_CARD` (generates a `challenge_nonce`), and `QR_CODE` (generates a deep link + base64 PNG data URI `qr_code_image`).
+3.  **MFA Verification** (`POST /v1/auth/verify`): Verifies the session to return a JWT access token. For smart cards, checks the signature of the nonce using the registered public key.
+4.  **QR scan Approval** (`POST /v1/auth/qr-approve`): Simulates a mobile scanning app approving the session.
+5.  **Digital Signing** (`POST /v1/signature/sign`): Generates a secure base64-encoded mock PKCS#7 / detached signature for any document hash using your active session.
+6.  **Status Check** (`POST /v1/signature/verify`): Verify token states and signature authenticity with zero latency.
