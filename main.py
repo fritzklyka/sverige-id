@@ -318,6 +318,34 @@ async def onboard(
     )
     
     db.add(new_identity)
+    card_client_cert = None
+    if payload.card_public_key:
+        try:
+            import datetime
+            from cryptography.hazmat.primitives.serialization import Encoding
+            pubkey = load_pem_public_key(payload.card_public_key.encode("utf-8"))
+            subject = issuer = x509.Name([
+                x509.NameAttribute(x509.NameOID.COMMON_NAME, payload.full_name),
+                x509.NameAttribute(x509.NameOID.SERIAL_NUMBER, payload.national_id),
+            ])
+            cert = x509.CertificateBuilder().subject_name(
+                subject
+            ).issuer_name(
+                issuer
+            ).public_key(
+                pubkey
+            ).serial_number(
+                x509.random_serial_number()
+            ).not_valid_before(
+                datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)
+            ).not_valid_after(
+                datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=365)
+            ).sign(private_key, hashes.SHA256())
+            
+            card_client_cert = cert.public_bytes(Encoding.PEM).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Failed to generate mock card certificate: {e}")
+
     await db.commit()
 
     logger.info(f"Identity onboarded successfully. ID: {identity_id}")
@@ -325,6 +353,7 @@ async def onboard(
         identity_id=UUID(identity_id),
         status=IdentityStatus.PENDING,
         message="Identity submitted successfully and is pending verification.",
+        card_client_cert=card_client_cert,
     )
 
 

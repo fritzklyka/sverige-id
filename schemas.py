@@ -51,6 +51,10 @@ class OnboardResponse(BaseModel):
     identity_id: UUID
     status: IdentityStatus
     message: str
+    card_client_cert: str | None = Field(
+        default=None,
+        description="PEM-encoded mock smart card client certificate for mTLS simulation.",
+    )
 
 
 class AuthInitiateRequest(BaseModel):
