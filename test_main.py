@@ -152,6 +152,8 @@ async def test_qr_code_flow():
         data_init = res_init.json()
         assert data_init["challenge_type"] == "QR_CODE"
         assert "qr_code_payload" in data_init
+        assert "qr_code_image" in data_init
+        assert data_init["qr_code_image"].startswith("data:image/png;base64,")
 
         session_id = data_init["session_id"]
 

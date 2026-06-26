@@ -1,10 +1,10 @@
 openapi: 3.0.3
 info:
-  title: Platform Electronic Identification (eID) Mock API
+  title: Sverige-ID Platform Electronic Identification (eID) API
   version: 1.0.0
   description: |
-    A mockup API for a platform Electronic Identification (eID) system.
-    This mock system manages identity registration/onboarding, session authentication,
+    API for a platform Electronic Identification (eID) system.
+    This platform manages identity registration/onboarding, session authentication,
     document signature generating, and verification.
 paths:
   /v1/identity/onboard:

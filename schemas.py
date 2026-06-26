@@ -77,6 +77,10 @@ class AuthInitiateResponse(BaseModel):
         default=None,
         description="QR code content payload for QR_CODE scans.",
     )
+    qr_code_image: str | None = Field(
+        default=None,
+        description="Base64 PNG QR code data URI.",
+    )
 
 
 class AuthVerifyRequest(BaseModel):

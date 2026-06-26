@@ -1,4 +1,5 @@
 import base64
+import io
 import logging
 import time
 from datetime import UTC, datetime
@@ -6,6 +7,7 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 import jwt
+import qrcode
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -42,7 +44,7 @@ logging.basicConfig(level=logging.INFO, format=log_format)
 logger = logging.getLogger("eid_backend")
 
 app = FastAPI(
-    title="Platform Electronic Identification (eID) Mock API",
+    title="Sverige-ID Platform Electronic Identification (eID) API",
     version="1.0.0",
 )
 
@@ -170,6 +172,7 @@ async def initiate_auth(payload: AuthInitiateRequest) -> AuthInitiateResponse:
     session_id = uuid4()
     challenge_nonce = None
     qr_code_payload = None
+    qr_code_image = None
 
     if payload.auth_method == ChallengeType.SMART_CARD:
         if not identity.get("card_public_key"):
@@ -195,6 +198,21 @@ async def initiate_auth(payload: AuthInitiateRequest) -> AuthInitiateResponse:
             "expires_at": time.time() + 300,
         }
         msg = "Scan the QR code with your mobile app to authenticate."
+        try:
+            qr = qrcode.QRCode(version=1, box_size=10, border=4)
+            qr.add_data(qr_code_payload)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            qr_bytes = buf.getvalue()
+            qr_code_image = (
+                f"data:image/png;base64,"
+                f"{base64.b64encode(qr_bytes).decode()}"
+            )
+        except Exception as err:
+            logger.error(f"Failed to generate QR Code image: {err}")
+            qr_code_image = None
     else:
         # PUSH_NOTIFICATION or TOTP
         auth_sessions_db[session_id] = {
@@ -215,6 +233,7 @@ async def initiate_auth(payload: AuthInitiateRequest) -> AuthInitiateResponse:
         challenge_message=msg,
         challenge_nonce=challenge_nonce,
         qr_code_payload=qr_code_payload,
+        qr_code_image=qr_code_image,
     )
 
 
