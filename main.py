@@ -140,7 +140,10 @@ def get_current_user(token: Annotated[Any, Depends(security_bearer)]) -> str:
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Any, exc: HTTPException) -> JSONResponse:
-    logger.error(f"HTTPException occurred: {exc.detail}")
+    if exc.status_code >= 500:
+        logger.error(f"HTTPException occurred: {exc.detail}")
+    else:
+        logger.warning(f"HTTPException occurred: {exc.detail}")
     return JSONResponse(
         status_code=exc.status_code,
         content=ErrorResponse(
